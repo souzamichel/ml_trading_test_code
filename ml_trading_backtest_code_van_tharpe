@@ -1,0 +1,1811 @@
+{
+  "cells": [
+    {
+      "cell_type": "code",
+      "source": [
+        "# 0. Instala dependências se necessário\n",
+        "import sys\n",
+        "import subprocess\n",
+        "\n",
+        "def install_if_missing(pkg):\n",
+        "    try:\n",
+        "        __import__(pkg)\n",
+        "    except ImportError:\n",
+        "        subprocess.check_call([sys.executable, \"-m\", \"pip\", \"install\", pkg])\n",
+        "\n",
+        "for pkg in (\"yfinance\", \"optuna\"):\n",
+        "    install_if_missing(pkg)"
+      ],
+      "metadata": {
+        "id": "ry-woJxXYV3h"
+      },
+      "execution_count": 65,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# 1. Imports\n",
+        "import os\n",
+        "import csv\n",
+        "import logging\n",
+        "import numpy as np\n",
+        "import pandas as pd\n",
+        "import yfinance as yf\n",
+        "import optuna\n",
+        "from joblib import Parallel, delayed\n",
+        "from sklearn.ensemble import RandomForestClassifier\n",
+        "from sklearn.model_selection import TimeSeriesSplit\n",
+        "from optuna.exceptions import TrialPruned"
+      ],
+      "metadata": {
+        "id": "Vg0ti4XpYdsi"
+      },
+      "execution_count": 66,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# 2. Configuração de logs\n",
+        "LOG_FILENAME = \"optimization.log\"\n",
+        "CSV_FILENAME = \"trial_results.csv\"\n",
+        "\n",
+        "logger = logging.getLogger(\"optuna_rf\")\n",
+        "logger.setLevel(logging.INFO)\n",
+        "\n",
+        "# File handler\n",
+        "fh = logging.FileHandler(LOG_FILENAME)\n",
+        "fh.setLevel(logging.INFO)\n",
+        "fh.setFormatter(logging.Formatter(\n",
+        "    \"%(asctime)s %(levelname)s [Trial %(trial_number)s] %(message)s\"\n",
+        "))\n",
+        "logger.addHandler(fh)\n",
+        "\n",
+        "# Console handler\n",
+        "ch = logging.StreamHandler(sys.stdout)\n",
+        "ch.setLevel(logging.INFO)\n",
+        "ch.setFormatter(logging.Formatter(\n",
+        "    \"%(asctime)s %(levelname)s [Trial %(trial_number)s] %(message)s\"\n",
+        "))\n",
+        "logger.addHandler(ch)"
+      ],
+      "metadata": {
+        "id": "buwdcbuvYnfS"
+      },
+      "execution_count": 67,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# 3. Cria CSV de auditoria (header)\n",
+        "if not os.path.exists(CSV_FILENAME):\n",
+        "    with open(CSV_FILENAME, \"w\", newline=\"\") as f:\n",
+        "        writer = csv.writer(f)\n",
+        "        writer.writerow([\n",
+        "            \"trial_number\",\n",
+        "            \"ma_short\", \"ma_long\", \"rsi_period\",\n",
+        "            \"n_estimators\", \"max_depth\",\n",
+        "            \"avg_recovery\", \"avg_win_rate\",\n",
+        "            \"state\"\n",
+        "        ])"
+      ],
+      "metadata": {
+        "id": "j2UwRszyXj49"
+      },
+      "execution_count": 68,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# 4. Indicadores e métricas\n",
+        "def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:\n",
+        "    delta    = series.diff()\n",
+        "    gain     = delta.clip(lower=0)\n",
+        "    loss     = -delta.clip(upper=0)\n",
+        "    avg_gain = gain.rolling(period).mean()\n",
+        "    avg_loss = loss.rolling(period).mean()\n",
+        "    rs       = avg_gain / avg_loss\n",
+        "    return 100 - (100 / (1 + rs))\n",
+        "\n",
+        "def calculate_metrics(returns: pd.Series) -> tuple:\n",
+        "    cumulative  = (1 + returns).cumprod() - 1\n",
+        "    running_max = cumulative.cummax()\n",
+        "    drawdown    = cumulative - running_max\n",
+        "    max_dd      = drawdown.min()\n",
+        "    total_ret   = cumulative.iloc[-1]\n",
+        "    win_rate    = (returns > 0).sum() / len(returns) if len(returns) else 0.0\n",
+        "    recovery    = (total_ret / abs(max_dd)) if max_dd < 0 else np.nan\n",
+        "    return recovery, win_rate"
+      ],
+      "metadata": {
+        "collapsed": true,
+        "id": "FWFK_dY3YFXm"
+      },
+      "execution_count": 69,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# 5. Carrega dados históricos\n",
+        "symbol = \"AAPL\"\n",
+        "data = yf.download(symbol, period=\"5y\", interval=\"1d\",\n",
+        "                   auto_adjust=True, progress=False)\n",
+        "data[\"Return\"] = data[\"Close\"].pct_change()\n",
+        "data.dropna(inplace=True)"
+      ],
+      "metadata": {
+        "collapsed": true,
+        "id": "NugLwbKiooop"
+      },
+      "execution_count": 70,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "\n",
+        "# 6. Função-objetivo com pruning e logs\n",
+        "def objective(trial: optuna.trial.Trial) -> float:\n",
+        "    # Espaço de busca\n",
+        "    ma_short     = trial.suggest_int(\"ma_short\", 5, 15, step=5)\n",
+        "    ma_long      = trial.suggest_int(\"ma_long\", 10, 30, step=10)\n",
+        "    if ma_long <= ma_short:\n",
+        "        ma_long = ma_short + 5\n",
+        "    rsi_period   = trial.suggest_categorical(\"rsi_period\", [14, 21])\n",
+        "    n_estimators = trial.suggest_categorical(\"n_estimators\", [50, 100])\n",
+        "    max_depth    = trial.suggest_categorical(\"max_depth\", [None, 5, 10])\n",
+        "\n",
+        "    # Contexto para logs\n",
+        "    logger = logging.LoggerAdapter(logging.getLogger(\"optuna_rf\"),\n",
+        "                                   {\"trial_number\": trial.number})\n",
+        "    params = {\n",
+        "        \"ma_short\": ma_short, \"ma_long\": ma_long, \"rsi_period\": rsi_period,\n",
+        "        \"n_estimators\": n_estimators, \"max_depth\": max_depth\n",
+        "    }\n",
+        "    logger.info(f\"Starting trial with params {params}\")\n",
+        "\n",
+        "    # Constroi DataFrame de features e target\n",
+        "    df = data.copy()\n",
+        "    df[\"MA_short\"] = df[\"Close\"].rolling(ma_short).mean()\n",
+        "    df[\"MA_long\"]  = df[\"Close\"].rolling(ma_long).mean()\n",
+        "    df[\"RSI\"]      = compute_rsi(df[\"Close\"], rsi_period)\n",
+        "    df.dropna(inplace=True)\n",
+        "\n",
+        "    fut = df[\"Close\"].pct_change().shift(-1)\n",
+        "    df[\"Target\"] = (fut > 0).astype(int)\n",
+        "    df.dropna(inplace=True)\n",
+        "\n",
+        "    X   = df[[\"MA_short\", \"MA_long\", \"RSI\"]]\n",
+        "    y   = df[\"Target\"]\n",
+        "    ret = df[\"Close\"].pct_change().loc[X.index]\n",
+        "\n",
+        "    tscv = TimeSeriesSplit(n_splits=5)\n",
+        "\n",
+        "    # Avalia folds em paralelo com pruning\n",
+        "    def eval_fold(train_idx, test_idx, fold_idx):\n",
+        "        X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]\n",
+        "        y_tr = y.iloc[train_idx]\n",
+        "        ret_te = ret.iloc[test_idx]\n",
+        "\n",
+        "        if y_tr.nunique() < 2 or len(X_te) < 2:\n",
+        "            return np.nan, np.nan\n",
+        "\n",
+        "        model = RandomForestClassifier(\n",
+        "            n_estimators=n_estimators,\n",
+        "            max_depth=max_depth,\n",
+        "            random_state=42\n",
+        "        )\n",
+        "        model.fit(X_tr, y_tr)\n",
+        "        preds = model.predict(X_te)\n",
+        "\n",
+        "        df_sig        = pd.DataFrame({\"signal\": preds}, index=X_te.index)\n",
+        "        df_sig[\"ret\"] = ret_te\n",
+        "        df_sig[\"strat\"] = df_sig[\"signal\"].shift(1, fill_value=0) * df_sig[\"ret\"]\n",
+        "\n",
+        "        if df_sig[\"strat\"].empty:\n",
+        "            return np.nan, np.nan\n",
+        "\n",
+        "        recovery, win_rate = calculate_metrics(df_sig[\"strat\"])\n",
+        "        # report & prune\n",
+        "        trial.report(recovery, step=fold_idx)\n",
+        "        logger.info(f\"Fold {fold_idx} — recovery: {recovery:.4f}, win_rate: {win_rate:.2%}\")\n",
+        "        if trial.should_prune():\n",
+        "            logger.info(f\"Pruning trial at fold {fold_idx}\")\n",
+        "            raise TrialPruned()\n",
+        "        return recovery, win_rate\n",
+        "\n",
+        "    # Executa os folds\n",
+        "    try:\n",
+        "        folds = Parallel(n_jobs=-1)(\n",
+        "            delayed(eval_fold)(tr, te, idx + 1)\n",
+        "            for idx, (tr, te) in enumerate(tscv.split(X))\n",
+        "        )\n",
+        "    except TrialPruned:\n",
+        "        # Grava no CSV o estado pruneado\n",
+        "        with open(CSV_FILENAME, \"a\", newline=\"\") as f:\n",
+        "            writer = csv.writer(f)\n",
+        "            writer.writerow([\n",
+        "                trial.number,\n",
+        "                ma_short, ma_long, rsi_period,\n",
+        "                n_estimators, max_depth,\n",
+        "                np.nan, np.nan,\n",
+        "                \"PRUNED\"\n",
+        "            ])\n",
+        "        raise\n",
+        "\n",
+        "    # Processa resultados completos\n",
+        "    recovs, wins = zip(*folds)\n",
+        "    recovs = np.array(recovs, dtype=float)\n",
+        "    recovs = recovs[~np.isnan(recovs)]\n",
+        "\n",
+        "    # Se algum fold inválido, retorna zero\n",
+        "    if len(recovs) < tscv.get_n_splits():\n",
+        "        mean_recov, mean_win = 0.0, 0.0\n",
+        "        state = \"FAILED\"\n",
+        "    else:\n",
+        "        mean_recov, mean_win = recovs.mean(), np.array(wins).mean()\n",
+        "        state = \"COMPLETE\"\n",
+        "\n",
+        "    # Persiste auditoria no CSV\n",
+        "    with open(CSV_FILENAME, \"a\", newline=\"\") as f:\n",
+        "        writer = csv.writer(f)\n",
+        "        writer.writerow([\n",
+        "            trial.number,\n",
+        "            ma_short, ma_long, rsi_period,\n",
+        "            n_estimators, max_depth,\n",
+        "            f\"{mean_recov:.6f}\", f\"{mean_win:.6f}\",\n",
+        "            state\n",
+        "        ])\n",
+        "\n",
+        "    logger.info(f\"Finished trial — avg_recovery: {mean_recov:.4f}, avg_win_rate: {mean_win:.2%}\")\n",
+        "    return mean_recov"
+      ],
+      "metadata": {
+        "collapsed": true,
+        "id": "RhP1t0cMorlS"
+      },
+      "execution_count": 71,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# 7. Execução do estudo com pruner\n",
+        "pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=2)\n",
+        "study = optuna.create_study(direction=\"maximize\", pruner=pruner)\n",
+        "study.optimize(objective, n_trials=50, n_jobs=1)"
+      ],
+      "metadata": {
+        "id": "BIXC0Tsswsm4",
+        "outputId": "391b1dff-7ead-45c3-8546-3687c0b4365c",
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        }
+      },
+      "execution_count": 72,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "[I 2025-07-27 22:20:46,662] A new study created in memory with name: no-name-8a40cc1e-687e-4d99-91d9-99e88fea588a\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:46,664 INFO [Trial 0] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:48,383 INFO [Trial 0] Finished trial — avg_recovery: 1.9196, avg_win_rate: 18.43%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.9196, avg_win_rate: 18.43%\n",
+            "[I 2025-07-27 22:20:48,385] Trial 0 finished with value: 1.919627713660746 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:48,387 INFO [Trial 1] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': None}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': None}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:49,209 INFO [Trial 1] Finished trial — avg_recovery: 0.0928, avg_win_rate: 17.94%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.0928, avg_win_rate: 17.94%\n",
+            "[I 2025-07-27 22:20:49,210] Trial 1 finished with value: 0.09281251495583909 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': None}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:49,212 INFO [Trial 2] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 21, 'n_estimators': 100, 'max_depth': 10}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 21, 'n_estimators': 100, 'max_depth': 10}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:50,202 INFO [Trial 2] Finished trial — avg_recovery: -0.3516, avg_win_rate: 17.55%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: -0.3516, avg_win_rate: 17.55%\n",
+            "[I 2025-07-27 22:20:50,204] Trial 2 finished with value: -0.35163461655249956 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 21, 'n_estimators': 100, 'max_depth': 10}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:50,205 INFO [Trial 3] Starting trial with params {'ma_short': 15, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 10}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 15, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 10}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:50,691 INFO [Trial 3] Finished trial — avg_recovery: 0.5259, avg_win_rate: 20.39%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.5259, avg_win_rate: 20.39%\n",
+            "[I 2025-07-27 22:20:50,694] Trial 3 finished with value: 0.525912913035101 and parameters: {'ma_short': 15, 'ma_long': 10, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 10}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:50,695 INFO [Trial 4] Starting trial with params {'ma_short': 15, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 15, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:51,302 INFO [Trial 4] Finished trial — avg_recovery: 0.0000, avg_win_rate: 0.00%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.0000, avg_win_rate: 0.00%\n",
+            "[I 2025-07-27 22:20:51,304] Trial 4 finished with value: 0.0 and parameters: {'ma_short': 15, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:51,306 INFO [Trial 5] Starting trial with params {'ma_short': 15, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': None}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 15, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': None}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:51,672 INFO [Trial 5] Finished trial — avg_recovery: 1.0181, avg_win_rate: 18.43%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.0181, avg_win_rate: 18.43%\n",
+            "[I 2025-07-27 22:20:51,674] Trial 5 finished with value: 1.0181012491367336 and parameters: {'ma_short': 15, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': None}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:51,677 INFO [Trial 6] Starting trial with params {'ma_short': 5, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 5, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:52,233 INFO [Trial 6] Finished trial — avg_recovery: 0.0000, avg_win_rate: 0.00%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.0000, avg_win_rate: 0.00%\n",
+            "[I 2025-07-27 22:20:52,235] Trial 6 finished with value: 0.0 and parameters: {'ma_short': 5, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:52,236 INFO [Trial 7] Starting trial with params {'ma_short': 15, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': None}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 15, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': None}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:52,923 INFO [Trial 7] Finished trial — avg_recovery: 0.3102, avg_win_rate: 17.86%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.3102, avg_win_rate: 17.86%\n",
+            "[I 2025-07-27 22:20:52,925] Trial 7 finished with value: 0.31018406462103326 and parameters: {'ma_short': 15, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': None}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:52,926 INFO [Trial 8] Starting trial with params {'ma_short': 15, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': None}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 15, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': None}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:53,303 INFO [Trial 8] Finished trial — avg_recovery: 0.0000, avg_win_rate: 0.00%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.0000, avg_win_rate: 0.00%\n",
+            "[I 2025-07-27 22:20:53,305] Trial 8 finished with value: 0.0 and parameters: {'ma_short': 15, 'ma_long': 10, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': None}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:53,306 INFO [Trial 9] Starting trial with params {'ma_short': 5, 'ma_long': 10, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': None}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 5, 'ma_long': 10, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': None}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:53,984 INFO [Trial 9] Finished trial — avg_recovery: 0.1373, avg_win_rate: 21.07%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.1373, avg_win_rate: 21.07%\n",
+            "[I 2025-07-27 22:20:53,986] Trial 9 finished with value: 0.13725732743112323 and parameters: {'ma_short': 5, 'ma_long': 10, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': None}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:53,998 INFO [Trial 10] Starting trial with params {'ma_short': 10, 'ma_long': 20, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 20, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:54,324 INFO [Trial 10] Finished trial — avg_recovery: 0.0000, avg_win_rate: 0.00%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.0000, avg_win_rate: 0.00%\n",
+            "[I 2025-07-27 22:20:54,327] Trial 10 finished with value: 0.0 and parameters: {'ma_short': 10, 'ma_long': 20, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:54,337 INFO [Trial 11] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:54,633 INFO [Trial 11] Finished trial — avg_recovery: 0.2452, avg_win_rate: 18.92%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.2452, avg_win_rate: 18.92%\n",
+            "[I 2025-07-27 22:20:54,635] Trial 11 finished with value: 0.24523391460807248 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:54,648 INFO [Trial 12] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': None}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': None}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:55,006 INFO [Trial 12] Finished trial — avg_recovery: 0.2410, avg_win_rate: 20.78%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.2410, avg_win_rate: 20.78%\n",
+            "[I 2025-07-27 22:20:55,007] Trial 12 finished with value: 0.24096326357168235 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': None}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:55,020 INFO [Trial 13] Starting trial with params {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:55,346 INFO [Trial 13] Finished trial — avg_recovery: 1.6476, avg_win_rate: 19.90%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.6476, avg_win_rate: 19.90%\n",
+            "[I 2025-07-27 22:20:55,349] Trial 13 finished with value: 1.6476113838074826 and parameters: {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:55,362 INFO [Trial 14] Starting trial with params {'ma_short': 5, 'ma_long': 20, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 5, 'ma_long': 20, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:55,660 INFO [Trial 14] Finished trial — avg_recovery: 0.0000, avg_win_rate: 0.00%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.0000, avg_win_rate: 0.00%\n",
+            "[I 2025-07-27 22:20:55,662] Trial 14 finished with value: 0.0 and parameters: {'ma_short': 5, 'ma_long': 20, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:55,674 INFO [Trial 15] Starting trial with params {'ma_short': 5, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 5, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:55,975 INFO [Trial 15] Finished trial — avg_recovery: 0.3242, avg_win_rate: 19.42%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.3242, avg_win_rate: 19.42%\n",
+            "[I 2025-07-27 22:20:55,977] Trial 15 finished with value: 0.3242166729228116 and parameters: {'ma_short': 5, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:55,988 INFO [Trial 16] Starting trial with params {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:56,298 INFO [Trial 16] Finished trial — avg_recovery: 1.6476, avg_win_rate: 19.90%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.6476, avg_win_rate: 19.90%\n",
+            "[I 2025-07-27 22:20:56,299] Trial 16 finished with value: 1.6476113838074826 and parameters: {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:56,312 INFO [Trial 17] Starting trial with params {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:56,616 INFO [Trial 17] Finished trial — avg_recovery: 1.6476, avg_win_rate: 19.90%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.6476, avg_win_rate: 19.90%\n",
+            "[I 2025-07-27 22:20:56,618] Trial 17 finished with value: 1.6476113838074826 and parameters: {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:56,630 INFO [Trial 18] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 10}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 10}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:56,958 INFO [Trial 18] Finished trial — avg_recovery: -0.3461, avg_win_rate: 18.82%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: -0.3461, avg_win_rate: 18.82%\n",
+            "[I 2025-07-27 22:20:56,960] Trial 18 finished with value: -0.3460764622295538 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 10}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:56,972 INFO [Trial 19] Starting trial with params {'ma_short': 5, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 5, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:57,281 INFO [Trial 19] Finished trial — avg_recovery: 0.3242, avg_win_rate: 19.42%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.3242, avg_win_rate: 19.42%\n",
+            "[I 2025-07-27 22:20:57,284] Trial 19 finished with value: 0.3242166729228116 and parameters: {'ma_short': 5, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:57,303 INFO [Trial 20] Starting trial with params {'ma_short': 10, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:57,623 INFO [Trial 20] Finished trial — avg_recovery: 0.0000, avg_win_rate: 0.00%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.0000, avg_win_rate: 0.00%\n",
+            "[I 2025-07-27 22:20:57,624] Trial 20 finished with value: 0.0 and parameters: {'ma_short': 10, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:57,637 INFO [Trial 21] Starting trial with params {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:57,939 INFO [Trial 21] Finished trial — avg_recovery: 1.6476, avg_win_rate: 19.90%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.6476, avg_win_rate: 19.90%\n",
+            "[I 2025-07-27 22:20:57,941] Trial 21 finished with value: 1.6476113838074826 and parameters: {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:57,954 INFO [Trial 22] Starting trial with params {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:58,263 INFO [Trial 22] Finished trial — avg_recovery: 1.6476, avg_win_rate: 19.90%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.6476, avg_win_rate: 19.90%\n",
+            "[I 2025-07-27 22:20:58,265] Trial 22 finished with value: 1.6476113838074826 and parameters: {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:58,276 INFO [Trial 23] Starting trial with params {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:58,591 INFO [Trial 23] Finished trial — avg_recovery: 1.6476, avg_win_rate: 19.90%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.6476, avg_win_rate: 19.90%\n",
+            "[I 2025-07-27 22:20:58,593] Trial 23 finished with value: 1.6476113838074826 and parameters: {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:58,606 INFO [Trial 24] Starting trial with params {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:58,906 INFO [Trial 24] Finished trial — avg_recovery: 1.6476, avg_win_rate: 19.90%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.6476, avg_win_rate: 19.90%\n",
+            "[I 2025-07-27 22:20:58,908] Trial 24 finished with value: 1.6476113838074826 and parameters: {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:58,921 INFO [Trial 25] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 10}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 10}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:59,267 INFO [Trial 25] Finished trial — avg_recovery: 0.4974, avg_win_rate: 19.02%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.4974, avg_win_rate: 19.02%\n",
+            "[I 2025-07-27 22:20:59,268] Trial 25 finished with value: 0.4974308135654967 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 10}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:59,285 INFO [Trial 26] Starting trial with params {'ma_short': 5, 'ma_long': 30, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 5, 'ma_long': 30, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:59,614 INFO [Trial 26] Finished trial — avg_recovery: -0.2699, avg_win_rate: 19.51%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: -0.2699, avg_win_rate: 19.51%\n",
+            "[I 2025-07-27 22:20:59,617] Trial 26 finished with value: -0.26987264708182174 and parameters: {'ma_short': 5, 'ma_long': 30, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:59,629 INFO [Trial 27] Starting trial with params {'ma_short': 10, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:59,941 INFO [Trial 27] Finished trial — avg_recovery: 0.0000, avg_win_rate: 0.00%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.0000, avg_win_rate: 0.00%\n",
+            "[I 2025-07-27 22:20:59,944] Trial 27 finished with value: 0.0 and parameters: {'ma_short': 10, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:20:59,956 INFO [Trial 28] Starting trial with params {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:00,264 INFO [Trial 28] Finished trial — avg_recovery: 1.6476, avg_win_rate: 19.90%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.6476, avg_win_rate: 19.90%\n",
+            "[I 2025-07-27 22:21:00,267] Trial 28 finished with value: 1.6476113838074826 and parameters: {'ma_short': 5, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:00,281 INFO [Trial 29] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': 10}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': 10}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:01,108 INFO [Trial 29] Finished trial — avg_recovery: 1.1959, avg_win_rate: 18.53%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.1959, avg_win_rate: 18.53%\n",
+            "[I 2025-07-27 22:21:01,109] Trial 29 finished with value: 1.1958859802413035 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': 10}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:01,127 INFO [Trial 30] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:01,687 INFO [Trial 30] Finished trial — avg_recovery: 1.9196, avg_win_rate: 18.43%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.9196, avg_win_rate: 18.43%\n",
+            "[I 2025-07-27 22:21:01,688] Trial 30 finished with value: 1.919627713660746 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:01,708 INFO [Trial 31] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:02,151 INFO [Trial 31] Finished trial — avg_recovery: 1.9196, avg_win_rate: 18.43%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.9196, avg_win_rate: 18.43%\n",
+            "[I 2025-07-27 22:21:02,152] Trial 31 finished with value: 1.919627713660746 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:02,171 INFO [Trial 32] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:02,546 INFO [Trial 32] Finished trial — avg_recovery: 1.9196, avg_win_rate: 18.43%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.9196, avg_win_rate: 18.43%\n",
+            "[I 2025-07-27 22:21:02,553] Trial 32 finished with value: 1.919627713660746 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:02,571 INFO [Trial 33] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:02,875 INFO [Trial 33] Finished trial — avg_recovery: 1.9196, avg_win_rate: 18.43%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.9196, avg_win_rate: 18.43%\n",
+            "[I 2025-07-27 22:21:02,878] Trial 33 finished with value: 1.919627713660746 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:02,890 INFO [Trial 34] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:03,443 INFO [Trial 34] Finished trial — avg_recovery: 1.9087, avg_win_rate: 18.43%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.9087, avg_win_rate: 18.43%\n",
+            "[I 2025-07-27 22:21:03,445] Trial 34 finished with value: 1.9086735493329237 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:03,458 INFO [Trial 35] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 10}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 10}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:03,820 INFO [Trial 35] Finished trial — avg_recovery: 0.4974, avg_win_rate: 19.02%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.4974, avg_win_rate: 19.02%\n",
+            "[I 2025-07-27 22:21:03,822] Trial 35 finished with value: 0.4974308135654967 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 10}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:03,837 INFO [Trial 36] Starting trial with params {'ma_short': 15, 'ma_long': 30, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 15, 'ma_long': 30, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:04,138 INFO [Trial 36] Finished trial — avg_recovery: -0.0390, avg_win_rate: 21.18%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: -0.0390, avg_win_rate: 21.18%\n",
+            "[I 2025-07-27 22:21:04,141] Trial 36 finished with value: -0.039014089927622043 and parameters: {'ma_short': 15, 'ma_long': 30, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:04,155 INFO [Trial 37] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:04,737 INFO [Trial 37] Finished trial — avg_recovery: 1.9087, avg_win_rate: 18.43%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.9087, avg_win_rate: 18.43%\n",
+            "[I 2025-07-27 22:21:04,738] Trial 37 finished with value: 1.9086735493329237 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:04,752 INFO [Trial 38] Starting trial with params {'ma_short': 10, 'ma_long': 15, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': None}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 15, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': None}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:05,120 INFO [Trial 38] Finished trial — avg_recovery: 0.4544, avg_win_rate: 16.60%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.4544, avg_win_rate: 16.60%\n",
+            "[I 2025-07-27 22:21:05,122] Trial 38 finished with value: 0.4544342339521451 and parameters: {'ma_short': 10, 'ma_long': 10, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': None}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:05,134 INFO [Trial 39] Starting trial with params {'ma_short': 15, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 15, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:05,719 INFO [Trial 39] Finished trial — avg_recovery: 0.0000, avg_win_rate: 0.00%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.0000, avg_win_rate: 0.00%\n",
+            "[I 2025-07-27 22:21:05,722] Trial 39 finished with value: 0.0 and parameters: {'ma_short': 15, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:05,734 INFO [Trial 40] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 10}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 10}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:06,063 INFO [Trial 40] Finished trial — avg_recovery: 0.4974, avg_win_rate: 19.02%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.4974, avg_win_rate: 19.02%\n",
+            "[I 2025-07-27 22:21:06,064] Trial 40 finished with value: 0.4974308135654967 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 10}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:06,083 INFO [Trial 41] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:06,387 INFO [Trial 41] Finished trial — avg_recovery: 1.9196, avg_win_rate: 18.43%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.9196, avg_win_rate: 18.43%\n",
+            "[I 2025-07-27 22:21:06,390] Trial 41 finished with value: 1.919627713660746 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:06,403 INFO [Trial 42] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:06,744 INFO [Trial 42] Finished trial — avg_recovery: 1.9196, avg_win_rate: 18.43%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.9196, avg_win_rate: 18.43%\n",
+            "[I 2025-07-27 22:21:06,745] Trial 42 finished with value: 1.919627713660746 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:06,761 INFO [Trial 43] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:07,072 INFO [Trial 43] Finished trial — avg_recovery: 1.9196, avg_win_rate: 18.43%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.9196, avg_win_rate: 18.43%\n",
+            "[I 2025-07-27 22:21:07,074] Trial 43 finished with value: 1.919627713660746 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:07,089 INFO [Trial 44] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': None}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': None}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:07,465 INFO [Trial 44] Finished trial — avg_recovery: 0.2410, avg_win_rate: 20.78%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.2410, avg_win_rate: 20.78%\n",
+            "[I 2025-07-27 22:21:07,467] Trial 44 finished with value: 0.24096326357168235 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': None}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:07,483 INFO [Trial 45] Starting trial with params {'ma_short': 15, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 15, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:07,802 INFO [Trial 45] Finished trial — avg_recovery: 0.9325, avg_win_rate: 20.39%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.9325, avg_win_rate: 20.39%\n",
+            "[I 2025-07-27 22:21:07,804] Trial 45 finished with value: 0.9324971934292762 and parameters: {'ma_short': 15, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:07,820 INFO [Trial 46] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:08,121 INFO [Trial 46] Finished trial — avg_recovery: 0.2452, avg_win_rate: 18.92%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.2452, avg_win_rate: 18.92%\n",
+            "[I 2025-07-27 22:21:08,127] Trial 46 finished with value: 0.24523391460807248 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 21, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:08,142 INFO [Trial 47] Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:08,456 INFO [Trial 47] Finished trial — avg_recovery: 1.9196, avg_win_rate: 18.43%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 1.9196, avg_win_rate: 18.43%\n",
+            "[I 2025-07-27 22:21:08,458] Trial 47 finished with value: 1.919627713660746 and parameters: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:08,471 INFO [Trial 48] Starting trial with params {'ma_short': 10, 'ma_long': 15, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': None}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 15, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': None}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:09,167 INFO [Trial 48] Finished trial — avg_recovery: 0.8878, avg_win_rate: 17.57%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.8878, avg_win_rate: 17.57%\n",
+            "[I 2025-07-27 22:21:09,174] Trial 48 finished with value: 0.8877548832769975 and parameters: {'ma_short': 10, 'ma_long': 10, 'rsi_period': 14, 'n_estimators': 100, 'max_depth': None}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:09,190 INFO [Trial 49] Starting trial with params {'ma_short': 10, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Starting trial with params {'ma_short': 10, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "2025-07-27 22:21:09,529 INFO [Trial 49] Finished trial — avg_recovery: 0.0000, avg_win_rate: 0.00%\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "INFO:optuna_rf:Finished trial — avg_recovery: 0.0000, avg_win_rate: 0.00%\n",
+            "[I 2025-07-27 22:21:09,532] Trial 49 finished with value: 0.0 and parameters: {'ma_short': 10, 'ma_long': 20, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}. Best is trial 0 with value: 1.919627713660746.\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "\n",
+        "# 8. Resultados finais\n",
+        "print(\"\\nBest trial:\")\n",
+        "best = study.best_trial\n",
+        "print(f\"  Trial #: {best.number}\")\n",
+        "print(f\"  Params: {best.params}\")\n",
+        "print(f\"  Avg WF Recovery: {best.value:.4f}\")\n",
+        "print(f\"\\nVeja '{LOG_FILENAME}' e '{CSV_FILENAME}' para logs e auditoria detalhada.\")"
+      ],
+      "metadata": {
+        "id": "gsuAy8JhwuRL",
+        "outputId": "d7210bfc-ca34-4ad1-d9b2-1dd892b9a445",
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        }
+      },
+      "execution_count": 73,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "\n",
+            "Best trial:\n",
+            "  Trial #: 0\n",
+            "  Params: {'ma_short': 10, 'ma_long': 30, 'rsi_period': 14, 'n_estimators': 50, 'max_depth': 5}\n",
+            "  Avg WF Recovery: 1.9196\n",
+            "\n",
+            "Veja 'optimization.log' e 'trial_results.csv' para logs e auditoria detalhada.\n"
+          ]
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "kernelspec": {
+      "display_name": "Python 3",
+      "language": "python",
+      "name": "python3"
+    },
+    "language_info": {
+      "codemirror_mode": {
+        "name": "ipython",
+        "version": 3
+      },
+      "file_extension": ".py",
+      "mimetype": "text/x-python",
+      "name": "python",
+      "nbconvert_exporter": "python",
+      "pygments_lexer": "ipython3",
+      "version": "3.7.3"
+    },
+    "colab": {
+      "provenance": []
+    }
+  },
+  "nbformat": 4,
+  "nbformat_minor": 0
+}
